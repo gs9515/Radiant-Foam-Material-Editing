@@ -4,18 +4,34 @@
 
 #include "../utils/typing.h"
 #include "camera.h"
+#include "material.cuh"
 
 namespace radfoam {
 
 struct TraceSettings {
     float weight_threshold;
     uint32_t max_intersections;
+    int   max_bounces;
+    float time = 0.f;
+};
+
+struct SceneSphere {
+    bool      enabled;
+    Vec3f     center;
+    float     radius;
+    
+    // 0 = still, 1 = lemniscate, 2 = circle, 3 = helix
+    int       path_type;
+    
+    rf::Material material;
 };
 
 inline TraceSettings default_trace_settings() {
     TraceSettings settings;
     settings.weight_threshold = 0.001f;
     settings.max_intersections = 1024;
+    settings.max_bounces = 3;
+    settings.time = 0.f;
     return settings;
 }
 
@@ -33,6 +49,7 @@ struct VisualizationSettings {
     bool checker_bg;
     float max_depth;
     float depth_quantile;
+    SceneSphere sphere;
 };
 
 inline VisualizationSettings default_visualization_settings() {
@@ -43,6 +60,10 @@ inline VisualizationSettings default_visualization_settings() {
     settings.checker_bg = false;
     settings.max_depth = 10.0f;
     settings.depth_quantile = 0.5f;
+
+    settings.sphere.enabled = false;
+    settings.sphere.path_type = 0;
+
     return settings;
 }
 

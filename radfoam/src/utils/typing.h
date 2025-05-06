@@ -145,12 +145,25 @@ struct CMapTable {
     const int *sizes;
 };
 
+#ifdef _CUDA_ARCH_
+// COMPILE FIX - for device code: provide a simple _device_ version.
 template <typename T>
-RADFOAM_HD void swap(T &a, T &b) {
+_device_ inline typename std::enable_if<!std::is_pointer<T>::value, void>::type 
+swap(T &a, T &b) {
+    T tmp = a;
+    a = b;
+    b = tmp;
+}
+#else
+// For host (or host/device if RADFOAM_HD expands to _host_ _device_)
+template <typename T>
+RADFOAM_HD inline typename std::enable_if<!std::is_pointer<T>::value, void>::type 
+swap(T &a, T &b) {
     typename std::decay<T>::type tmp = a;
     a = b;
     b = tmp;
 }
+#endif
 
 /// @brief Compute the base-2 logarithm of an integer
 inline RADFOAM_HD uint32_t log2(uint32_t x) {

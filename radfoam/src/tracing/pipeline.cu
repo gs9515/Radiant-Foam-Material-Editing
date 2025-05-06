@@ -9,6 +9,12 @@
 #include "sh_utils.cuh"
 #include "tracing_utils.cuh"
 
+// bring in namespace rf and MaterialType
+#include "material.cuh"
+
+// Number of samples each special material ray should do
+static constexpr int NUM_SAMPLES = 16;
+
 namespace radfoam {
 
 template <typename attr_scalar, int sh_degree, int block_size>
@@ -354,6 +360,7 @@ visualization(TraceSettings settings,
               CMapTable cmap_table,
               Camera camera,
               cudaSurfaceObject_t output_rgba,
+              const SceneSphere sphere,
               uint32_t start_point_index) {
 
     uint32_t thread_idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -373,6 +380,80 @@ visualization(TraceSettings settings,
     }
 
     auto sh_coeffs = sh_coefficients<sh_degree>(ray.direction);
+
+    float t_hit;
+    Vec3f normal;
+
+    // one seed per pixel
+    uint32_t seed = __float_as_uint(ray.origin.x()*12.9898f + ray.origin.y()*78.233f);
+    uint32_t rng_state = seed;
+
+    Vec3f animated_center = animated_sphere_position(settings.time, sphere.path_type, sphere.center);
+
+    if (sphere.enabled &&
+        intersect_sphere(ray, animated_center, sphere.radius, t_hit, normal))
+    {
+        Vec3f accum = Vec3f::Zero();
+        for (int i = 0; i < NUM_SAMPLES; ++i) {
+            // Compute the exact hit point on the sphere
+            Vec3f hit_point = ray.origin + t_hit * ray.direction;
+
+            // Use rf::scatter to pick a new ray based on the sphere.material
+            rf::ScatterRec rec = rf::scatter(
+                sphere.material,
+                ray.direction,
+                hit_point,
+                normal,
+                rng_state
+            );
+
+            // If the material said “no scatter”, just write black and comtinue:
+            if (!rec.did_scatter) {
+                surf2Dwrite(0, output_rgba, 4*pix_i, camera.height-1-pix_j);
+                return;
+            }
+
+            // Otherwise, spawn the scattered ray and trace the rest of the scene!
+            Ray scattered = {
+                // IMPORTANT - offset to avoid self‑intersection
+                hit_point + 1e-3f * rec.direction,
+                rec.direction
+            };
+
+            // Trace into the volume and tint by the material’s albedo (color)
+            Vec3f traced = radfoam::trace_ray_scene<attr_scalar,sh_degree>(
+                scattered,
+                sphere,
+                points,
+                attributes,
+                point_adjacency,
+                point_adjacency_offsets,
+                adjacent_diff,
+                start_point_index,
+                settings,
+                sh_coeffs
+            );
+
+            // Combine the material’s color with whatever the rest of the scene returns
+            Vec3f sample_rgb = rec.attenuation.cwiseProduct(traced);
+
+            accum += sample_rgb;
+        }
+
+        // now do the SINGLE average from all the samples
+        Vec3f pixel_rgb = accum / float(NUM_SAMPLES);
+
+        surf2Dwrite(
+            make_rgba8(pixel_rgb.x(),
+                    pixel_rgb.y(),
+                    pixel_rgb.z(),
+                    1.0f),
+            output_rgba,
+            4*pix_i,
+            camera.height-1-pix_j
+        );
+        return;
+    }
 
     auto load_attributes = [&](uint32_t v_idx, Vec3f &rgb, float &s) {
         const attr_scalar *attr_ptr = attributes + v_idx * attr_memory_size;
@@ -718,11 +799,17 @@ class CUDATracingPipeline : public Pipeline {
         uint32_t num_rays = camera.width * camera.height;
         constexpr uint32_t block_size = 128;
 
+        // Add a special animated settings to support animations
+        TraceSettings animated_settings = settings;
+        static int frame_idx = 0;
+        animated_settings.time = frame_idx * 0.016f;
+        frame_idx++;
+
         launch_kernel_1d<block_size>(
             visualization<attr_scalar, sh_degree, block_size>,
             num_rays,
             stream,
-            settings,
+            animated_settings,
             reinterpret_cast<const Vec3f *>(points),
             reinterpret_cast<const attr_scalar *>(attributes),
             reinterpret_cast<const uint32_t *>(point_adjacency),
@@ -732,6 +819,7 @@ class CUDATracingPipeline : public Pipeline {
             cmap_table,
             camera,
             output_surface,
+            vis_settings.sphere,
             start_index);
     }
 

@@ -19,6 +19,39 @@
 #include "../utils/cuda_helpers.h"
 #include "viewer.h"
 
+#include <nvml.h>
+#include <sys/resource.h>
+#include <chrono>
+#include <fstream>
+
+static nvmlDevice_t g_nvmlDevice;
+static bool          g_nvmlInited = false;
+
+void initProfiling() {
+  if (nvmlInit() == NVML_SUCCESS) {
+    nvmlDeviceGetHandleByIndex(0, &g_nvmlDevice);
+    g_nvmlInited = true;
+  }
+}
+
+static double lastCpuTime = 0.0;
+static auto   lastWall    = std::chrono::high_resolution_clock::now();
+
+double sampleCpuUsage() {
+  struct rusage u;
+  getrusage(RUSAGE_SELF, &u);
+  double cpuTime = u.ru_utime.tv_sec + u.ru_utime.tv_usec/1e6
+                 + u.ru_stime.tv_sec + u.ru_stime.tv_usec/1e6;
+
+  auto nowWall = std::chrono::high_resolution_clock::now();
+  double wallSec = std::chrono::duration<double>(nowWall - lastWall).count();
+
+  double usagePct = ((cpuTime - lastCpuTime) / wallSec) * 100.0;
+  lastCpuTime = cpuTime;
+  lastWall    = nowWall;
+  return usagePct;
+}
+
 void glfwErrorCallback(int error, const char *description) {
     std::cerr << "GLFW Error (" << error << "): " << description << std::endl;
 }
@@ -514,6 +547,15 @@ radfoam::CMapTable upload_cmap_data() {
 } // namespace
 
 struct ViewerPrivate : public Viewer {
+    std::ofstream logFile;
+    bool        prevSphereEnabled;
+    int         prevPathType;
+    std::chrono::high_resolution_clock::time_point logStart;
+    std::chrono::high_resolution_clock::time_point lastMetricLog;
+
+
+    SceneSphere sphere;
+
     std::shared_ptr<Pipeline> pipeline;
 
     ViewerOptions options;
@@ -593,6 +635,12 @@ struct ViewerPrivate : public Viewer {
         iteration = 0;
         training = false;
         scene_updating = false;
+
+        // —— flush and close the CSV log —— 
+        if (logFile.is_open()) {
+            logFile.flush();
+            logFile.close();
+        }
 
         glfwMakeContextCurrent(window);
         glfwSwapInterval(0);
@@ -686,6 +734,19 @@ struct ViewerPrivate : public Viewer {
 
         std::unique_lock<std::mutex> lock(scene_mutex);
 
+        initProfiling();
+        // Open the log file
+        logFile.open("radfoam_perf.csv");
+        // CSV header: timestamp(s),fps,cpuPct,gpuPct,memPct,event_type,event_info
+        logFile << "t,fps,cpu, gpu, mem, event, info\n";
+
+        prevSphereEnabled = vis_settings.sphere.enabled;
+        prevPathType      = vis_settings.sphere.path_type;
+
+        // mark time zero
+        logStart      = std::chrono::high_resolution_clock::now();
+        lastMetricLog = logStart;
+
         while (!glfwWindowShouldClose(window)) {
             glfwPollEvents();
 
@@ -772,6 +833,165 @@ struct ViewerPrivate : public Viewer {
                 }
             }
 
+            // —— sample VRAM, GPU util, and CPU usage each frame (second) —— 
+            float usedMB  = 0.0f, totalMB = 0.0f;
+            float gpuPct  = 0.0f, memPct  = 0.0f;
+            if (g_nvmlInited) {
+                // memory info
+                nvmlMemory_t mem;
+                if (nvmlDeviceGetMemoryInfo(g_nvmlDevice, &mem) == NVML_SUCCESS) {
+                    usedMB  = float(mem.used)  / (1024.0f*1024.0f);
+                    totalMB = float(mem.total) / (1024.0f*1024.0f);
+                }
+
+                // utilization rates
+                nvmlUtilization_t util;
+                if (nvmlDeviceGetUtilizationRates(g_nvmlDevice, &util) == NVML_SUCCESS) {
+                    gpuPct = float(util.gpu);
+                    memPct = float(util.memory);
+                }
+            }
+
+            // per‐thread CPU usage
+            float cpuPct = static_cast<float>(sampleCpuUsage());
+            auto logTimePoint = std::chrono::high_resolution_clock::now();
+            double t = std::chrono::duration<float>(logTimePoint - logStart).count();
+
+
+            // Log metrics once per second
+            if (logTimePoint - lastMetricLog >= std::chrono::seconds(1)) {
+                logFile
+                << t << ","               // time since start
+                << frame_rate << ","      // fps
+                << cpuPct    << ","       // CPU %
+                << gpuPct    << ","       // GPU %
+                << memPct                 // Mem %
+                << ",,\n";                // no event for this
+                lastMetricLog = logTimePoint;
+            }
+
+            // Detect when sphere is changed
+            if (vis_settings.sphere.enabled != prevSphereEnabled) {
+                logFile << t << ",, , , ,"
+                        << (vis_settings.sphere.enabled ? "SPHERE_ON" : "SPHERE_OFF")
+                        << ",\n";
+                prevSphereEnabled = vis_settings.sphere.enabled;
+            }
+
+            // Detect when path‑type is changed
+            if (vis_settings.sphere.path_type != prevPathType) {
+                logFile << t << ",,,,"
+                        << ",PATH_TYPE," << vis_settings.sphere.path_type
+                        << "\n";
+                prevPathType = vis_settings.sphere.path_type;
+            }
+
+            // Include UI for machine load stats
+            ImGui::SeparatorText("Live Ray Tracing");
+            ImGui::Text("GPU VRAM: %.0f / %.0f MB",         usedMB, totalMB);
+            ImGui::Text("GPU Util: %.0f%% compute, %.0f%% mem", gpuPct, memPct);
+            ImGui::Text("CPU Load: %.1f %%",               cpuPct);
+
+            if (vis_settings.sphere.enabled) {
+                // If sphere is enabled, show "Remove Virtual Sphere" button
+                if (ImGui::Button("Remove Virtual Sphere")) {
+                    vis_settings.sphere.enabled = false;
+                }
+                
+                // Add material selection dropdown only when sphere is enabled
+                const char* material_types[] = { "Lambert", "Metal", "Dielectric" };
+                int current_material = static_cast<int>(vis_settings.sphere.material.type);
+                if (ImGui::Combo("Material Type", &current_material, material_types, IM_ARRAYSIZE(material_types))) {
+                    vis_settings.sphere.material.type = static_cast<rf::MaterialType>(current_material);
+                    
+                    // Set default values based on material type
+                    if (vis_settings.sphere.material.type == rf::MaterialType::LAMBERT) {
+                        vis_settings.sphere.material.albedo = rf::Vec3f(0.8f, 0.8f, 0.8f);
+                    } else if (vis_settings.sphere.material.type == rf::MaterialType::METAL) {
+                        vis_settings.sphere.material.albedo = rf::Vec3f(0.8f, 0.85f, 0.9f);
+                        vis_settings.sphere.material.fuzz = 0.02f;
+                    } else if (vis_settings.sphere.material.type == rf::MaterialType::DIELECTRIC) {
+                        vis_settings.sphere.material.albedo = rf::Vec3f(1.0f, 1.0f, 1.0f);
+                        vis_settings.sphere.material.ref_idx = 1.02f;
+                    }
+                }
+                
+                // Add material property controls based on material type
+                if (vis_settings.sphere.material.type == rf::MaterialType::LAMBERT) {
+                    ImGui::ColorEdit3("Diffuse Color", reinterpret_cast<float*>(&vis_settings.sphere.material.albedo));
+                }
+                else if (vis_settings.sphere.material.type == rf::MaterialType::METAL) {
+                    ImGui::ColorEdit3("Metal Color", reinterpret_cast<float*>(&vis_settings.sphere.material.albedo));
+                    ImGui::SliderFloat("Roughness", &vis_settings.sphere.material.fuzz, 0.0f, 1.0f, "%.2f");
+                }
+                else if (vis_settings.sphere.material.type == rf::MaterialType::DIELECTRIC) {
+                    ImGui::SliderFloat("Refractive Index", &vis_settings.sphere.material.ref_idx, 1.0f, 2.5f, "%.2f");
+                    ImGui::Text("Dielectric materials are transparent/clear");
+                }
+                
+                // Add sphere size control
+                ImGui::SliderFloat("Sphere Radius", &vis_settings.sphere.radius, 0.1f, 1.0f, "%.2f");
+
+                // Add path type dropdown for animation style
+                const char* path_types[] = { "Static", "Lemniscate (Infinity)", "Loop", "Hop" };
+                if (ImGui::Combo("Path Type", &vis_settings.sphere.path_type, path_types, IM_ARRAYSIZE(path_types))) {
+                    // Reset sphere position if switching from animated to static
+                    if (vis_settings.sphere.path_type == 0) {
+                        // position it 1.5 units in front of the camera
+                        Eigen::Vector3f pos(
+                            camera.position.data[0],
+                            camera.position.data[1],
+                            camera.position.data[2]
+                        );
+                        Eigen::Vector3f forward(
+                            camera.forward.data[0],
+                            camera.forward.data[1],
+                            camera.forward.data[2]
+                        );
+                        vis_settings.sphere.center = Vec3f(
+                            pos.x() + 2.5f * forward.x(),
+                            pos.y() + 2.5f * forward.y(),
+                            pos.z() + 2.5f * forward.z()
+                        );
+                    }
+                }
+                if (ImGui::Button("Reset Scene")) {
+                    vis_settings.sphere.enabled = false;
+                }
+            } 
+            else {
+                // If sphere is disabled, show "Add Virtual Sphere" button
+                if (ImGui::Button("Add Virtual Sphere")) {
+                    // enable the sphere
+                    vis_settings.sphere.enabled = true;
+
+                    // position it 1.5 units in front of the camera
+                    Eigen::Vector3f pos(
+                        camera.position.data[0],
+                        camera.position.data[1],
+                        camera.position.data[2]
+                    );
+                    Eigen::Vector3f forward(
+                        camera.forward.data[0],
+                        camera.forward.data[1],
+                        camera.forward.data[2]
+                    );
+                    vis_settings.sphere.center = Vec3f(
+                        pos.x() + 2.5f * forward.x(),
+                        pos.y() + 2.5f * forward.y(),
+                        pos.z() + 2.5f * forward.z()
+                    );
+                    vis_settings.sphere.radius = 0.3f;
+
+                    // assign it a default DIELECTRIC material
+                    vis_settings.sphere.material.type = rf::MaterialType::METAL;
+                    vis_settings.sphere.material.albedo = rf::Vec3f(0.8f, 0.8f, 0.8f);
+                    vis_settings.sphere.material.fuzz = 0.02f;      // default for metal
+                    vis_settings.sphere.material.ref_idx = 1.02f;   // default for dielectric
+                }
+            }
+
+            
             ImGui::SeparatorText("Viewer settings");
 
             ImGui::Text("Resolution: %dx%d", camera.width, camera.height);
